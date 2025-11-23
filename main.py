@@ -101,11 +101,12 @@ async def run_with_timeout(coro: Awaitable[List[Dict[str, str]]], timeout: float
         return []
 
 
-async def aggregate_crawlers(actor_name: str, total_timeout: float = 30.0) -> List[Dict[str, str]]:
+async def aggregate_crawlers(actor_name: str, total_timeout: float = 120.0) -> List[Dict[str, str]]:
     """Chạy tất cả crawler song song và hợp nhất kết quả, giới hạn tổng thời gian."""
     async def gather_all():
-        tasks = [run_with_timeout(crawler(actor_name), timeout=total_timeout) for crawler in CRAWLERS]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
+        # Tăng timeout cho từng crawler con để tận dụng tối đa thời gian tổng
+        tasks = [run_with_timeout(crawler(actor_name), timeout=total_timeout - 2.0) for crawler in CRAWLERS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         merged: List[Dict[str, str]] = []
         for items in results:
             if isinstance(items, list):
@@ -113,8 +114,16 @@ async def aggregate_crawlers(actor_name: str, total_timeout: float = 30.0) -> Li
         return merged
 
     try:
+        # Nếu tổng thời gian vượt quá total_timeout, trả về những gì đã thu thập được thay vì []
+        # Tuy nhiên logic hiện tại wrap cả gather trong wait_for, nếu timeout sẽ raise Exception.
+        # Để an toàn hơn, ta để gather tự chạy với timeout bên trong run_with_timeout cho từng task.
+        # Ở đây ta chỉ dùng wait_for như một chốt chặn cuối cùng.
         return await asyncio.wait_for(gather_all(), timeout=total_timeout)
     except asyncio.TimeoutError:
+        print("Aggregate timeout hit! Returning empty list (consider refactoring to return partial results).")
+        return []
+    except Exception as e:
+        print(f"Aggregate error: {e}")
         return []
 
 
@@ -128,9 +137,11 @@ async def fetch_and_cache(actor_name: str, session: Session) -> List[Dict[str, s
         videos_db = session.exec(
             select(Video).where(Video.actor_id == actor_obj.id).order_by(Video.created_at.desc())
         ).all()
-        return [{"source": v.source, "title": v.title, "link": v.link} for v in videos_db]
+        # Nếu có cache và có video thì trả về. Nếu cache rỗng (0 video), có thể do lần trước lỗi -> Crawl lại.
+        if videos_db:
+            return [{"source": v.source, "title": v.title, "link": v.link} for v in videos_db]
 
-    # Crawl mới
+    # Crawl mới (do hết hạn cache HOẶC cache không có video)
     results = await aggregate_crawlers(actor_name)
 
     if not actor_obj:

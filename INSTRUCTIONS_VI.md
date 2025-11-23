@@ -83,6 +83,12 @@ services:
 - **Vấn đề:** File này bị thiếu, gây khó khăn cho việc cài đặt môi trường local.
 - **Sửa chữa:** Đã tạo file `requirements.txt` với đầy đủ dependencies.
 
+### 5. Cải thiện logic Crawl (`main.py`)
+- **Vấn đề:** Khi tìm kiếm, nếu kết nối timeout hoặc lần trước lỗi (lưu 0 kết quả), hệ thống vẫn trả về cache rỗng.
+- **Sửa chữa:**
+  - Tăng thời gian chờ (timeout) lên 120 giây để đảm bảo crawl đủ dữ liệu.
+  - Thêm cơ chế tự động crawl lại nếu trong cache không có video nào (0 video).
+
 ---
 
 ## Phần 2: Cấu hình cho localhost:8080
