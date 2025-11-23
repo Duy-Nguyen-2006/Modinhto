@@ -7,6 +7,7 @@ FastAPI aggregation server: chạy song song các crawler, cache kết quả và
 import asyncio
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Dict, List, Optional
+import os
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,8 +44,11 @@ class Video(SQLModel, table=True):
     source: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+# Ensure data directory exists
+data_dir = Path("./data")
+data_dir.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = "sqlite:///./data/data.db"
+DB_PATH = f"sqlite:///{data_dir}/data.db"
 engine = create_engine(DB_PATH, connect_args={"check_same_thread": False})
 
 
@@ -206,3 +210,8 @@ def serve_index():
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="index.html not found")
     return FileResponse(index_path)
+
+if __name__ == "__main__":
+    import uvicorn
+    # Use 8080 as requested for localhost
+    uvicorn.run(app, host="0.0.0.0", port=8080)
