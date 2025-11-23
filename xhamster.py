@@ -4,6 +4,7 @@
 Crawler xhamster: tim video theo ten dien vien, tra ve list dict cho backend.
 """
 
+import asyncio
 import re
 import unicodedata
 from typing import List, Dict
@@ -125,3 +126,26 @@ async def search_videos_by_actor(actress_name: str) -> List[Dict[str, str]]:
         return videos
     except Exception:
         return []
+
+
+def _print_results(results: List[Dict[str, str]]) -> None:
+    """In ket qua ra console."""
+    if not results:
+        print("Khong tim thay video.")
+        return
+    for idx, item in enumerate(results, 1):
+        print(f"{idx}. [{item.get('source', '')}] {item.get('title', '')} - {item.get('link', '')}")
+
+
+async def _main() -> None:
+    actress = input("Nhap ten dien vien: ").strip()
+    if not actress:
+        print("Ten dien vien khong duoc de trong.")
+        return
+    print("Dang tim kiem, vui long doi...")
+    results = await search_videos_by_actor(actress)
+    _print_results(results)
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())

@@ -7,14 +7,11 @@ FastAPI aggregation server: chạy song song các crawler, cache kết quả và
 import asyncio
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Dict, List, Optional
-import os
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlalchemy import func
-from pathlib import Path
 
 from heovl import search_videos_by_actor as search_heovl
 from javx import search_videos_by_actor as search_javx
@@ -44,11 +41,8 @@ class Video(SQLModel, table=True):
     source: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-# Ensure data directory exists
-data_dir = Path("./data")
-data_dir.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = f"sqlite:///{data_dir}/data.db"
+DB_PATH = "sqlite:///./data.db"
 engine = create_engine(DB_PATH, connect_args={"check_same_thread": False})
 
 
@@ -101,12 +95,11 @@ async def run_with_timeout(coro: Awaitable[List[Dict[str, str]]], timeout: float
         return []
 
 
-async def aggregate_crawlers(actor_name: str, total_timeout: float = 120.0) -> List[Dict[str, str]]:
+async def aggregate_crawlers(actor_name: str, total_timeout: float = 30.0) -> List[Dict[str, str]]:
     """Chạy tất cả crawler song song và hợp nhất kết quả, giới hạn tổng thời gian."""
     async def gather_all():
-        # Tăng timeout cho từng crawler con để tận dụng tối đa thời gian tổng
-        tasks = [run_with_timeout(crawler(actor_name), timeout=total_timeout - 2.0) for crawler in CRAWLERS]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [run_with_timeout(crawler(actor_name), timeout=total_timeout) for crawler in CRAWLERS]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
         merged: List[Dict[str, str]] = []
         for items in results:
             if isinstance(items, list):
@@ -114,16 +107,8 @@ async def aggregate_crawlers(actor_name: str, total_timeout: float = 120.0) -> L
         return merged
 
     try:
-        # Nếu tổng thời gian vượt quá total_timeout, trả về những gì đã thu thập được thay vì []
-        # Tuy nhiên logic hiện tại wrap cả gather trong wait_for, nếu timeout sẽ raise Exception.
-        # Để an toàn hơn, ta để gather tự chạy với timeout bên trong run_with_timeout cho từng task.
-        # Ở đây ta chỉ dùng wait_for như một chốt chặn cuối cùng.
         return await asyncio.wait_for(gather_all(), timeout=total_timeout)
     except asyncio.TimeoutError:
-        print("Aggregate timeout hit! Returning empty list (consider refactoring to return partial results).")
-        return []
-    except Exception as e:
-        print(f"Aggregate error: {e}")
         return []
 
 
@@ -137,11 +122,9 @@ async def fetch_and_cache(actor_name: str, session: Session) -> List[Dict[str, s
         videos_db = session.exec(
             select(Video).where(Video.actor_id == actor_obj.id).order_by(Video.created_at.desc())
         ).all()
-        # Nếu có cache và có video thì trả về. Nếu cache rỗng (0 video), có thể do lần trước lỗi -> Crawl lại.
-        if videos_db:
-            return [{"source": v.source, "title": v.title, "link": v.link} for v in videos_db]
+        return [{"source": v.source, "title": v.title, "link": v.link} for v in videos_db]
 
-    # Crawl mới (do hết hạn cache HOẶC cache không có video)
+    # Crawl mới
     results = await aggregate_crawlers(actor_name)
 
     if not actor_obj:
@@ -216,13 +199,5 @@ def home(session: Session = Depends(get_session)):
 
 
 @app.get("/", include_in_schema=False)
-def serve_index():
-    index_path = Path(__file__).parent / "index.html"
-    if not index_path.exists():
-        raise HTTPException(status_code=404, detail="index.html not found")
-    return FileResponse(index_path)
-
-if __name__ == "__main__":
-    import uvicorn
-    # Use 8080 as requested for localhost
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+def root():
+    return {"message": "Video crawler service is running. Use /api/search?actor=<name>."}

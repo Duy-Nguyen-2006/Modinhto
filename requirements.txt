@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-sqlmodel
-sqlalchemy
-crawl4ai
-beautifulsoup4
-playwright
