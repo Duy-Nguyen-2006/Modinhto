@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Crawler HeoVL: tim video theo ten dien vien, tra ve list dict cho backend.
+Crawler HeoVL: tim video theo ten dien vien su dung DuckDuckGo, tra ve list dict cho backend.
 """
 
 import asyncio
 import re
 import unicodedata
 from typing import List, Dict, Optional
-from urllib.parse import urljoin, urlparse, parse_qs, unquote, quote_plus
+from urllib.parse import urljoin, urlparse, parse_qs, quote_plus
 
 from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
@@ -23,62 +23,66 @@ def normalize_name_to_url(name: str) -> str:
     return name
 
 
-async def search_actress_slug_via_duckduckgo(actress_name: str) -> Optional[str]:
-    """Tim slug actress qua DuckDuckGo (lay tu ket qua heovl.*)."""
-    search_query = f"heovl {actress_name}"
-    ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(search_query)}"
-    print(f"Tim slug qua DuckDuckGo: {ddg_url}")
-
+async def search_actress_via_duckduckgo(crawler: AsyncWebCrawler, actress_name: str) -> Optional[str]:
+    """
+    Tim URL dien vien chinh xac tren HeoVL bang cach search qua DuckDuckGo.
+    
+    Returns:
+        URL slug cua dien vien, hoac None neu khong tim thay
+    """
     try:
-        async with AsyncWebCrawler(verbose=False, headless=True) as crawler:
-            result = await crawler.arun(
-                url=ddg_url,
-                bypass_cache=True,
-                delay_before_return_html=2.0
-            )
-
+        # Tao query tim kiem
+        search_query = f"{actress_name} site:heovl.moe/actresses"
+        encoded_query = quote_plus(search_query)
+        duckduckgo_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
+        
+        print(f"🔍 Tim kiem DuckDuckGo: '{actress_name}'...")
+        
+        run_config = CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            word_count_threshold=5,
+            page_timeout=30000,
+            js_code="await new Promise(r => setTimeout(r, 3000));",
+        )
+        
+        result = await crawler.arun(url=duckduckgo_url, config=run_config)
+        
         if not result.success:
-            print("Khong lay duoc ket qua DuckDuckGo.")
+            print("  ✗ Khong ket noi duoc DuckDuckGo")
             return None
-
+        
         soup = BeautifulSoup(result.html, "html.parser")
-        result_links = soup.find_all("a", class_="result__a")
-        if not result_links:
-            print("DuckDuckGo khong tra ve ket qua nao.")
-            return None
-
-        candidates = []
-        for link in result_links:
+        
+        # Tim tat ca link trong ket qua
+        all_links = soup.find_all("a", href=True)
+        
+        for link in all_links:
             href = link.get("href", "")
-            text = link.get_text().strip()
-
-            if "uddg=" in href:
-                parsed = urlparse(href)
-                params = parse_qs(parsed.query)
-                if "uddg" in params:
-                    real_url = unquote(params["uddg"][0])
-                else:
-                    real_url = href
-            else:
-                real_url = href
-
-            m = re.search(r"heovl\.[a-z]+/actresses/([^/?#]+)", real_url, re.IGNORECASE)
-            if m:
-                slug = m.group(1)
-                candidates.append({"slug": slug, "url": real_url, "text": text})
-
-        if not candidates:
-            print("Khong tim thay link heovl trong ket qua.")
-            return None
-
-        first = candidates[0]
-        print(f"Tim thay actress: {first['text']}")
-        print(f"Slug: {first['slug']}")
-        print(f"Source: {first['url']}")
-        return first["slug"]
-
-    except Exception as exc:
-        print(f"Loi khi search DuckDuckGo: {exc}")
+            
+            # Parse URL redirect cua DuckDuckGo
+            if "/l/?uddg=" in href or "uddg=" in href:
+                try:
+                    parsed = urlparse(href)
+                    params = parse_qs(parsed.query)
+                    if "uddg" in params:
+                        actual_url = params["uddg"][0]
+                        href = actual_url
+                except:
+                    pass
+            
+            # Kiem tra neu la link heovl.moe/actresses/
+            if "heovl.moe/actresses/" in href:
+                slug_match = re.search(r"heovl\.moe/actresses/([^/?#]+)", href)
+                if slug_match:
+                    slug = slug_match.group(1)
+                    print(f"  ✓ Tim thay: {slug}")
+                    return slug
+        
+        print("  ✗ Khong tim thay tren DuckDuckGo")
+        return None
+        
+    except Exception as e:
+        print(f"  ✗ Loi: {e}")
         return None
 
 
@@ -154,18 +158,11 @@ async def crawl_heovl_actress(crawler: AsyncWebCrawler, actress_url: str) -> Lis
 
 async def search_videos_by_actor(actress_name: str) -> List[Dict[str, str]]:
     """
-    Tra ve danh sach video theo ten dien vien.
+    Tra ve danh sach video theo ten dien vien su dung DuckDuckGo search.
 
     Output: [{'source': 'HeoVL', 'title': str, 'link': str}, ...]
     """
     try:
-        slug = await search_actress_slug_via_duckduckgo(actress_name)
-        if not slug:
-            slug = normalize_name_to_url(actress_name)
-            print(f"Dung slug tu normalize: {slug}")
-
-        actress_url = f"https://heovl.moe/actresses/{slug}"
-
         browser_config = BrowserConfig(
             headless=True,
             verbose=False,
@@ -179,26 +176,51 @@ async def search_videos_by_actor(actress_name: str) -> List[Dict[str, str]]:
         )
 
         async with AsyncWebCrawler(config=browser_config) as crawler:
+            # Tim kiem qua DuckDuckGo
+            actress_slug = await search_actress_via_duckduckgo(crawler, actress_name)
+            
+            # Neu khong tim thay, dung cach cu
+            if not actress_slug:
+                print("⚠️  Thu tim kiem truc tiep...")
+                actress_slug = normalize_name_to_url(actress_name)
+            
+            actress_url = f"https://heovl.moe/actresses/{actress_slug}"
+            print(f"🌐 Crawl: {actress_url}")
+            
             return await crawl_heovl_actress(crawler, actress_url)
-    except Exception:
+    except Exception as e:
+        print(f"❌ Loi: {e}")
         return []
 
 
 def _print_results(results: List[Dict[str, str]]) -> None:
     """In ket qua ra console."""
     if not results:
-        print("Khong tim thay video.")
+        print("\n" + "=" * 80)
+        print("❌ KHONG TIM THAY VIDEO")
+        print("=" * 80)
         return
+    
+    print("\n" + "=" * 80)
+    print(f"✓ TIM THAY {len(results)} VIDEO")
+    print("=" * 80)
     for idx, item in enumerate(results, 1):
-        print(f"{idx}. [{item.get('source', '')}] {item.get('title', '')} - {item.get('link', '')}")
+        print(f"\n{idx}. [{item.get('source', '')}] {item.get('title', '')}")
+        print(f"   🔗 {item.get('link', '')}")
+    print("\n" + "=" * 80)
 
 
 async def _main() -> None:
-    actress = input("Nhap ten dien vien: ").strip()
+    print("=" * 80)
+    print("         HeoVL VIDEO CRAWLER - DUCKDUCKGO SEARCH")
+    print("=" * 80)
+    
+    actress = input("\n🎬 Ten dien vien: ").strip()
     if not actress:
-        print("Ten dien vien khong duoc de trong.")
+        print("❌ Ten khong duoc de trong.")
         return
-    print("Dang tim kiem, vui long doi...")
+    
+    print("\n" + "=" * 80)
     results = await search_videos_by_actor(actress)
     _print_results(results)
 
