@@ -36,7 +36,7 @@ def check_actor_in_content(content: str, actor_name: str) -> bool:
 
 async def search_vlxx_url_via_duckduckgo(actor_name: str) -> Optional[str]:
     """Tim URL vlxx.bz cua dien vien qua DuckDuckGo."""
-    search_query = f"vlxx.bz {actor_name}"
+    search_query = f"vlxx.bz tag {actor_name}"
     ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(search_query)}"
     print(f"🔍 Tim URL qua DuckDuckGo: {ddg_url}")
 
@@ -73,63 +73,74 @@ async def search_vlxx_url_via_duckduckgo(actor_name: str) -> Optional[str]:
             if "vlxx.bz" not in real_url.lower():
                 continue
             
-            # Tim slug tu URL
-            patterns = [
-                r"vlxx\.bz/(tag|dien-vien|actor|model)/([^/?#]+)",
-                r"vlxx\.bz/video/([^/?#]+)"
-            ]
-
-            for pattern in patterns:
-                m = re.search(pattern, real_url, re.IGNORECASE)
-                if m:
-                    if len(m.groups()) >= 2:
-                        slug = m.group(2)
-                    else:
-                        slug = m.group(1)
-                    
-                    # Uu tien URL tag/dien-vien/actor
-                    if m.group(1) in ['tag', 'dien-vien', 'actor', 'model']:
-                        candidates.append({"url": real_url, "text": text, "slug": slug, "priority": 1})
-                    else:
-                        candidates.append({"url": real_url, "text": text, "slug": slug, "priority": 2})
-                    break
+            # Tim slug tu URL - CHI QUAN TAM TAG/DIEN-VIEN/ACTOR/MODEL
+            pattern = r"vlxx\.bz/(tag|dien-vien|actor|model)/([^/?#]+)"
+            m = re.search(pattern, real_url, re.IGNORECASE)
+            if m:
+                category = m.group(1)
+                slug = m.group(2)
+                candidates.append({
+                    "url": real_url, 
+                    "text": text, 
+                    "slug": slug,
+                    "category": category
+                })
+                print(f"  → Tim thay: {real_url}")
 
         if not candidates:
-            print("❌ Khong tim thay link vlxx.bz trong ket qua.")
+            print("❌ Khong tim thay link vlxx.bz/tag/ trong ket qua.")
             return None
 
-        # Sap xep theo priority
-        candidates.sort(key=lambda x: x.get("priority", 99))
         first = candidates[0]
-        print(f"✅ Tim thay: {first['text']}")
+        print(f"✅ Chon: {first['text']}")
         print(f"✅ URL: {first['url']}")
-        print(f"✅ Slug: {first.get('slug', 'N/A')}")
+        print(f"✅ Slug: {first['slug']}")
         return first["url"]
     except Exception as exc:
         print(f"❌ Loi khi search DuckDuckGo: {exc}")
         return None
 
 async def find_actor_tag_page(crawler: AsyncWebCrawler, actor_name: str) -> Optional[str]:
-    """Thu tim cac trang tag/actor."""
-    slug = normalize_name_to_slug(actor_name)
-    possible_urls = [
-        f"https://vlxx.bz/tag/{slug}/",
-        f"https://vlxx.bz/dien-vien/{slug}/",
-        f"https://vlxx.bz/actor/{slug}/",
-        f"https://vlxx.bz/model/{slug}/",
+    """Thu tim cac trang tag/actor voi nhieu bien the slug."""
+    # Tao cac bien the cua slug
+    slug_variants = [
+        normalize_name_to_slug(actor_name),  # eimi-fukda
     ]
+    
+    # Them cac bien the co them 'a' o cuoi (eimi fukda → eimi-fukada)
+    base_slug = normalize_name_to_slug(actor_name)
+    words = base_slug.split("-")
+    if len(words) >= 2 and not words[-1].endswith("a"):
+        words[-1] = words[-1] + "a"
+        slug_variants.append("-".join(words))
+    
+    print(f"🔍 Thu cac bien the slug: {slug_variants}")
+    
     run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, word_count_threshold=10)
-
-    for url in possible_urls:
-        try:
-            result = await crawler.arun(url=url, config=run_config)
-            if result.success and "404" not in result.html.lower() and "not found" not in result.html.lower():
-                print(f"✅ Tim thay trang: {url}")
-                return url
-        except Exception:
-            continue
-
-    print(f"⚠️ Khong tim thay trang tag/actor, dung search")
+    
+    for slug in slug_variants:
+        possible_urls = [
+            f"https://vlxx.bz/tag/{slug}/",
+            f"https://vlxx.bz/dien-vien/{slug}/",
+            f"https://vlxx.bz/actor/{slug}/",
+            f"https://vlxx.bz/model/{slug}/",
+        ]
+        
+        for url in possible_urls:
+            try:
+                print(f"  → Thu: {url}")
+                result = await crawler.arun(url=url, config=run_config)
+                if result.success and "404" not in result.html.lower() and "not found" not in result.html.lower():
+                    # Kiem tra xem co video khong
+                    soup = BeautifulSoup(result.html, "html.parser")
+                    video_links = soup.find_all("a", href=lambda x: x and "/video/" in x)
+                    if len(video_links) > 0:
+                        print(f"✅ Tim thay trang co video: {url}")
+                        return url
+            except Exception:
+                continue
+    
+    print(f"⚠️ Khong tim thay trang tag/actor")
     return None
 
 def extract_max_page_number(soup: BeautifulSoup) -> int:
@@ -160,13 +171,13 @@ def extract_max_page_number(soup: BeautifulSoup) -> int:
         text = div.get_text()
         numbers = re.findall(r'\b(\d+)\b', text)
         for num in numbers:
-            if int(num) > max_page and int(num) < 1000:  # Reasonable page limit
+            if int(num) > max_page and int(num) < 1000:
                 max_page = int(num)
 
     # GIOI HAN TOI DA 10 TRANG
     if max_page > 10:
+        print(f"⚠️ Gioi han tim kiem tu {max_page} xuong 10 trang")
         max_page = 10
-        print(f"⚠️ Gioi han tim kiem toi da 10 trang")
     
     return max_page
 
@@ -261,11 +272,8 @@ async def crawl_vlxx_all_pages(crawler: AsyncWebCrawler, base_url: str, actor_na
         # Lap qua cac trang con lai
         if max_page > 1:
             for page_num in range(2, max_page + 1):
-                # Xu ly URL pagination - PHAN BIET SEARCH VA TAG/ACTOR PAGE
-                if "?s=" in base_url:
-                    # URL search: https://vlxx.bz/?s=keyword → /page/2/?s=keyword
-                    page_url = f"https://vlxx.bz/page/{page_num}/{base_url.split('vlxx.bz')[-1]}"
-                elif "/page/" in base_url:
+                # Xu ly URL pagination
+                if "/page/" in base_url:
                     page_url = re.sub(r'/page/\d+/?', f'/page/{page_num}/', base_url)
                 elif base_url.endswith('/'):
                     page_url = f"{base_url}page/{page_num}/"
@@ -305,19 +313,17 @@ async def search_videos_by_actor(actor_name: str) -> List[Dict[str, str]]:
             # Buoc 1: Tim URL qua DuckDuckGo
             base_url = await search_vlxx_url_via_duckduckgo(actor_name)
 
-            # Buoc 2: Neu khong tim thay, thu tim trang tag/actor
+            # Buoc 2: Neu khong tim thay, thu tim trang tag/actor voi bien the slug
             if not base_url:
                 base_url = await find_actor_tag_page(crawler, actor_name)
 
-            # Buoc 3: Neu van khong co, dung search
-            filter_by_content = False
+            # Buoc 3: Neu van khong co, dung search (khong nen dung vi khong chinh xac)
             if not base_url:
-                base_url = f"https://vlxx.bz/?s={quote(actor_name)}"
-                filter_by_content = True
-                print(f"⚠️ Dung search URL: {base_url}")
+                print(f"❌ Khong tim thay trang tag/actor cho '{actor_name}'")
+                return []
 
             # Buoc 4: Crawl tat ca cac trang
-            return await crawl_vlxx_all_pages(crawler, base_url, actor_name, filter_by_content)
+            return await crawl_vlxx_all_pages(crawler, base_url, actor_name, filter_by_content=False)
     except Exception as exc:
         print(f"❌ Loi: {exc}")
         return []

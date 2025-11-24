@@ -1,33 +1,81 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Crawler xvideos3.com: tim video theo ten dien vien, tra ve list dict cho backend.
+Crawler xvideos.com: tim video theo ten dien vien, tra ve list dict cho backend.
+Co chuan hoa ten qua DuckDuckGo.
 """
 
 import asyncio
 import re
 import unicodedata
-from typing import List, Dict
+from typing import List, Dict, Optional
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 
 from bs4 import BeautifulSoup
-from crawl4ai import AsyncWebCrawler
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 
 
-def normalize_name(name: str) -> str:
-    """Chuan hoa ten thanh slug don gian."""
-    name_normalized = unicodedata.normalize("NFKD", name or "")
-    name_no_accents = "".join([c for c in name_normalized if not unicodedata.combining(c)])
-    name_lower = name_no_accents.lower()
-    name_clean = re.sub(r"[^a-z0-9\s-]", "", name_lower)
-    slug = re.sub(r"\s+", "-", name_clean.strip())
-    slug = re.sub(r"-+", "-", slug)
-    return slug
+def normalize_name_to_url(name: str) -> str:
+    """Chuan hoa ten dien vien thanh slug cho URL XVideos."""
+    name = unicodedata.normalize("NFD", name)
+    name = "".join(char for char in name if unicodedata.category(char) != "Mn")
+    name = name.lower().strip().replace(" ", "-")
+    name = "".join(char for char in name if char.isalnum() or char == "-")
+    return name
 
 
-def create_actress_url(actress_name: str, base_url: str = "https://www.xvideos3.com") -> str:
-    """Tao URL trang dien vien."""
-    slug = normalize_name(actress_name)
-    return f"{base_url}/pornstars/{slug}"
+async def search_xvideos_slug_via_duckduckgo(actor_name: str) -> Optional[str]:
+    """Tim slug pornstar XVideos qua DuckDuckGo."""
+    search_query = f"xvideos pornstars {actor_name}"
+    ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(search_query)}"
+    print(f"🔍 Tim slug qua DuckDuckGo: {ddg_url}")
+
+    try:
+        browser_config = BrowserConfig(headless=True, verbose=False)
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, delay_before_return_html=2.0)
+            result = await crawler.arun(url=ddg_url, config=run_config)
+
+        if not result.success:
+            print("❌ Khong lay duoc ket qua DuckDuckGo.")
+            return None
+
+        soup = BeautifulSoup(result.html, "html.parser")
+        links = soup.find_all("a", class_="result__a")
+        if not links:
+            print("❌ DuckDuckGo khong tra ve ket qua nao.")
+            return None
+
+        candidates = []
+        for link in links:
+            href = link.get("href", "")
+            text = link.get_text().strip()
+            if "uddg=" in href:
+                parsed = urlparse(href)
+                params = parse_qs(parsed.query)
+                real_url = unquote(params.get("uddg", [""])[0]) if params.get("uddg") else href
+            else:
+                real_url = href
+
+            # Pattern cho xvideos, xvideos2, xvideos3, etc.
+            m = re.search(r"xvideos[0-9]*\.[a-z]+/pornstars/([^/?#]+)", real_url, re.IGNORECASE)
+            if m:
+                slug = m.group(1)
+                candidates.append({"slug": slug, "url": real_url, "text": text})
+
+        if not candidates:
+            print("❌ Khong tim thay link xvideos trong ket qua.")
+            return None
+
+        first = candidates[0]
+        print(f"✅ Tim thay actress: {first['text']}")
+        print(f"✅ Slug: {first['slug']}")
+        print(f"✅ URL: {first['url']}")
+        return first["slug"]
+    except Exception as exc:
+        print(f"❌ Loi khi search DuckDuckGo: {exc}")
+        return None
 
 
 def is_valid_video(video_element) -> bool:
@@ -49,14 +97,21 @@ def is_valid_video(video_element) -> bool:
         return False
 
 
-async def search_videos_by_actor(actress_name: str) -> List[Dict[str, str]]:
+async def search_videos_by_actor(actress_name: str, base_url: str = "https://www.xvideos.com") -> List[Dict[str, str]]:
     """
     Tra ve danh sach video theo ten dien vien.
+    Co chuan hoa ten qua DuckDuckGo.
 
     Output: [{'source': 'XVideos', 'title': str, 'link': str}, ...]
     """
     try:
-        actress_url = create_actress_url(actress_name)
+        # Buoc 1: Tim slug qua DuckDuckGo
+        slug = await search_xvideos_slug_via_duckduckgo(actress_name)
+        if not slug:
+            slug = normalize_name_to_url(actress_name)
+            print(f"⚠️ Dung slug tu normalize: {slug}")
+
+        actress_url = f"{base_url}/pornstars/{slug}"
         videos: List[Dict[str, str]] = []
         seen_urls = set()
 
@@ -100,7 +155,7 @@ async def search_videos_by_actor(actress_name: str) -> List[Dict[str, str]]:
                     continue
 
                 if not video_link.startswith("http"):
-                    video_link = f"https://www.xvideos3.com{video_link}"
+                    video_link = f"{base_url}{video_link}"
 
                 if video_link in seen_urls:
                     continue
