@@ -2,15 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 Crawler Pornhub: tim video theo ten dien vien qua trang search, tra ve list dict.
+Phien ban nay su dung cloudscraper de bypass Cloudflare protection.
+
+NOTE: Do website co bot detection manh, co the can su dung:
+1. VPN/Proxy neu IP bi chan
+2. Selenium voi undetected-chromedriver (xem porn_hub_selenium.py)
+3. API pornhub (neu co)
 """
 
-import asyncio
 import unicodedata
 from typing import List, Dict
 from urllib.parse import quote
+import time
+
+try:
+    import cloudscraper
+    CLOUDSCRAPER_AVAILABLE = True
+except ImportError:
+    CLOUDSCRAPER_AVAILABLE = False
+    import requests
 
 from bs4 import BeautifulSoup
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 
 
 def normalize_name(name: str) -> str:
@@ -36,35 +48,108 @@ def check_actor_in_content(content: str, actor_name: str) -> bool:
     return False
 
 
-async def crawl_videos(crawler: AsyncWebCrawler, url: str, actor_name: str) -> List[Dict]:
+def crawl_videos(url: str, actor_name: str, debug: bool = False) -> List[Dict]:
     """Crawl trang search va loc video theo ten dien vien."""
-    run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, word_count_threshold=10)
-    result = await crawler.arun(url=url, config=run_config)
-    if not result.success:
+
+    # Tao scraper hoac session
+    if CLOUDSCRAPER_AVAILABLE:
+        scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'mobile': False
+            },
+            delay=10  # Delay de tranh bi phat hien
+        )
+    else:
+        import requests
+        scraper = requests.Session()
+
+    # Headers gia lap browser that
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+    }
+
+    try:
+        # Retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if debug:
+                    print(f"Attempt {attempt + 1}/{max_retries} - Fetching: {url}")
+
+                response = scraper.get(url, headers=headers, timeout=30, allow_redirects=True)
+
+                if response.status_code == 403:
+                    if debug:
+                        print(f"Got 403, waiting {2 ** attempt} seconds before retry...")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+
+                response.raise_for_status()
+                break
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                if debug:
+                    print(f"Error on attempt {attempt + 1}: {e}")
+                time.sleep(2 ** attempt)
+
+    except Exception as e:
+        print(f"Error fetching URL after {max_retries} attempts: {e}")
         return []
 
-    soup = BeautifulSoup(result.html, "html.parser")
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    video_blocks = soup.find_all("li", class_="pcVideoListItem")
-    if not video_blocks:
-        video_blocks = soup.find_all("div", class_="videoBox")
-    if not video_blocks:
-        video_blocks = soup.find_all(
-            ["li", "div"], class_=lambda x: x and "video" in x.lower()
-        )
+    if debug:
+        print(f"Page title: {soup.title.string if soup.title else 'No title'}")
+        print(f"Page length: {len(response.text)} characters")
+
+    # Tim video blocks voi nhieu selector
+    video_blocks = []
+    selectors = [
+        {"name": "li", "class": "pcVideoListItem"},
+        {"name": "div", "class": "videoBox"},
+        {"name": "div", "class": "phimage"},
+        {"name": "li", "class": "videoblock"},
+    ]
+
+    for selector in selectors:
+        video_blocks = soup.find_all(selector["name"], class_=selector["class"])
+        if video_blocks:
+            if debug:
+                print(f"Found {len(video_blocks)} blocks using selector: {selector}")
+            break
+
+    # Neu khong tim thay, thu tim tat ca link video
     if not video_blocks:
         video_links = soup.find_all(
-            "a", href=lambda x: x and ("/view_video" in x or "/video/" in x)
+            "a", href=lambda x: x and ("/view_video" in x or "/video/" in x or "/viewkey" in x)
         )
-        video_blocks = [link.parent for link in video_links]
+        video_blocks = [link.parent for link in video_links if link.parent]
+        if debug:
+            print(f"Found {len(video_blocks)} blocks using href search")
 
     videos: List[Dict[str, str]] = []
 
     for block in video_blocks:
         try:
+            # Tim the a chua link
             link_tag = (
-                block.find("a", class_=lambda x: x and "title" in x.lower())
-                or block.find("a", href=lambda x: x and ("/view_video" in x or "/video/" in x))
+                block.find("a", class_=lambda x: x and any(cls in str(x).lower() for cls in ["title", "thumb", "video"]))
+                or block.find("a", href=lambda x: x and ("/view_video" in x or "/video/" in x or "/viewkey" in x))
                 or block.find("a", href=True)
             )
             if not link_tag:
@@ -78,22 +163,43 @@ async def crawl_videos(crawler: AsyncWebCrawler, url: str, actor_name: str) -> L
             elif not video_link.startswith("http"):
                 continue
 
+            # Tim title
+            video_title = ""
+
+            # Thu title attribute
             video_title = link_tag.get("title", "").strip()
+
+            # Thu data-title
+            if not video_title:
+                video_title = link_tag.get("data-title", "").strip()
+
+            # Thu tim element co class title
             if not video_title:
                 title_elem = block.find(
-                    ["span", "div", "h2", "h3"], class_=lambda x: x and "title" in x.lower()
+                    ["span", "div", "h2", "h3", "a", "p"],
+                    class_=lambda x: x and any(cls in str(x).lower() for cls in ["title", "video-title"])
                 )
                 if title_elem:
                     video_title = title_elem.get_text().strip()
+
+            # Thu text trong link
             if not video_title:
                 video_title = link_tag.get_text().strip()
+
+            # Thu alt/title cua anh
             if not video_title:
                 img_tag = link_tag.find("img")
                 if img_tag:
                     video_title = img_tag.get("alt", "").strip() or img_tag.get("title", "").strip()
-            if not video_title or len(video_title) < 3:
-                video_title = "No title"
 
+            # Neu van khong co title thi bo qua
+            if not video_title or len(video_title) < 3:
+                continue
+
+            # Lam sach title
+            video_title = ' '.join(video_title.split())
+
+            # Kiem tra ten dien vien co trong title khong
             if not check_actor_in_content(video_title, actor_name):
                 continue
 
@@ -104,24 +210,29 @@ async def crawl_videos(crawler: AsyncWebCrawler, url: str, actor_name: str) -> L
                     "link": video_link,
                 }
             )
-        except Exception:
+        except Exception as e:
+            if debug:
+                print(f"Error parsing block: {e}")
             continue
 
     return videos
 
 
-async def search_videos_by_actor(actor_name: str) -> List[Dict[str, str]]:
+def search_videos_by_actor(actor_name: str, debug: bool = False) -> List[Dict[str, str]]:
     """
     Tra ve danh sach video theo ten dien vien.
+
+    Args:
+        actor_name: Ten dien vien can tim
+        debug: Bat debug mode de xem chi tiet
 
     Output: [{'source': 'Pornhub', 'title': str, 'link': str}, ...]
     """
     try:
-        browser_config = BrowserConfig(headless=True, verbose=False)
-        async with AsyncWebCrawler(config=browser_config) as crawler:
-            search_url = f"https://www.pornhub.com/video/search?search={quote(actor_name)}"
-            return await crawl_videos(crawler, search_url, actor_name)
-    except Exception:
+        search_url = f"https://www.pornhub.com/video/search?search={quote(actor_name)}"
+        return crawl_videos(search_url, actor_name, debug=debug)
+    except Exception as e:
+        print(f"Error in search_videos_by_actor: {e}")
         return []
 
 
@@ -134,15 +245,15 @@ def _print_results(results: List[Dict[str, str]]) -> None:
         print(f"{idx}. [{item.get('source', '')}] {item.get('title', '')} - {item.get('link', '')}")
 
 
-async def _main() -> None:
+def _main() -> None:
     actor = input("Nhap ten dien vien: ").strip()
     if not actor:
         print("Ten dien vien khong duoc de trong.")
         return
     print("Dang tim kiem, vui long doi...")
-    results = await search_videos_by_actor(actor)
+    results = search_videos_by_actor(actor)
     _print_results(results)
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    _main()
