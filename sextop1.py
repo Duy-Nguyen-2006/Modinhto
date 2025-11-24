@@ -1,158 +1,269 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Crawler sextop1.movie: tim video theo ten dien vien, tra ve list dict.
+Crawler SexTop1.movie: Tim video theo ten dien vien su dung Crawl4AI
+Tinh nang:
+- Tu dong tim ten dung qua DuckDuckGo
+- Thu nhieu dang URL (first-last, last-first)
+- Crawl toi da 10 trang
+- Loai bo trung lap
 """
 
 import asyncio
 import re
 import unicodedata
-from typing import List, Dict
-from urllib.parse import quote
-
+from typing import List, Dict, Optional
+import requests
 from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 
+
 def normalize_name_to_url(name: str) -> str:
-    """Chuyen ten dien vien thanh slug cho URL sextop1."""
+    """Chuyen ten dien vien thanh slug cho URL."""
     name = unicodedata.normalize("NFD", name)
     name = "".join(char for char in name if unicodedata.category(char) != "Mn")
     name = name.lower().strip().replace(" ", "-")
     name = "".join(char for char in name if char.isalnum() or char == "-")
+    name = re.sub(r'-+', '-', name).strip('-')
     return name
 
-async def search_actress_on_duckduckgo(crawler: AsyncWebCrawler, actor_name: str) -> str:
-    """Tim kiem URL chinh xac cua dien vien qua DuckDuckGo."""
-    try:
-        query = f"site:sextop1.movie/actresses {actor_name}"
-        search_url = f"https://duckduckgo.com/html/?q={quote(query)}"
-        
-        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, word_count_threshold=5)
-        result = await crawler.arun(url=search_url, config=run_config)
-        
-        if not result.success:
-            # Neu khong tim duoc, tra ve URL mac dinh
-            return f"https://sextop1.movie/actresses/{normalize_name_to_url(actor_name)}"
-        
-        soup = BeautifulSoup(result.html, "html.parser")
-        
-        # Tim ket qua dau tien chua /actresses/
-        for link in soup.find_all("a", href=True):
-            href = link.get("href", "")
-            if "sextop1.movie/actresses/" in href:
-                match = re.search(r'https?://sextop1\.movie/actresses/([^&?\s/]+)', href)
-                if match:
-                    actress_slug = match.group(1)
-                    return f"https://sextop1.movie/actresses/{actress_slug}"
-        
-        # Neu khong tim thay, tra ve URL mac dinh
-        return f"https://sextop1.movie/actresses/{normalize_name_to_url(actor_name)}"
-    except Exception:
-        return f"https://sextop1.movie/actresses/{normalize_name_to_url(actor_name)}"
 
-async def crawl_sextop1_actress_page(crawler: AsyncWebCrawler, actress_url: str, page: int) -> List[Dict[str, str]]:
-    """Crawl mot trang cua dien vien tren sextop1 va tra ve video list."""
-    if page > 1:
-        page_url = f"{actress_url}?page={page}"
-    else:
-        page_url = actress_url
-    
+def search_actress_on_duckduckgo(actress_name: str) -> Optional[str]:
+    """Tim ten dung cua dien vien qua DuckDuckGo."""
+    try:
+        print(f"[DuckDuckGo] Tim kiem: {actress_name}")
+        
+        query = f"{actress_name} actress jav pornstar"
+        search_url = f"https://html.duckduckgo.com/html/?q={query}"
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(search_url, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            return None
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        results = soup.find_all('a', class_='result__a')
+        
+        if not results:
+            return None
+        
+        first_result = results[0].get_text(strip=True)
+        print(f"[DuckDuckGo] Ket qua: {first_result}")
+        
+        # Trich xuat ten (lay phan truoc dau : hoac -)
+        match = re.match(r'^([^:\-\|]+)', first_result)
+        if match:
+            actress_found = match.group(1).strip()
+            normalized = normalize_name_to_url(actress_found)
+            print(f"[DuckDuckGo] Slug: {normalized}")
+            return normalized
+        
+        return None
+        
+    except Exception as e:
+        print(f"[DuckDuckGo] Loi: {e}")
+        return None
+
+
+async def crawl_sextop1_page(crawler: AsyncWebCrawler, page_url: str) -> List[Dict[str, str]]:
+    """Crawl mot trang cua dien vien va tra ve video list."""
     run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, word_count_threshold=10)
     result = await crawler.arun(url=page_url, config=run_config)
+    
     if not result.success:
         return []
 
     soup = BeautifulSoup(result.html, "html.parser")
-    video_blocks = soup.find_all("div", class_="item")
     
+    # Tim container chua video
+    items_container = soup.find('div', class_='items')
+    if not items_container:
+        return []
+    
+    # Tim tat ca video items
+    video_items = items_container.find_all('div', class_='item')
+
     videos: List[Dict[str, str]] = []
-    seen_links = set()
 
-    for block in video_blocks:
+    for item in video_items:
         try:
-            link_tags = block.find_all("a", href=True)
-            for link_tag in link_tags:
-                video_link = link_tag.get("href", "")
-                if not video_link or "/phim-sex/" not in video_link:
-                    continue
+            # Tim the <a> co class "item__title"
+            link_tag = item.find('a', class_='item__title')
+            
+            if not link_tag:
+                continue
+            
+            video_link = link_tag.get("href", "")
+            if not video_link:
+                continue
 
-                if video_link.startswith("/"):
-                    video_link = f"https://sextop1.movie{video_link}"
-                elif not video_link.startswith("http"):
-                    video_link = f"https://sextop1.movie/{video_link}"
+            if video_link.startswith("/"):
+                video_link = f"https://sextop1.movie{video_link}"
+            elif not video_link.startswith("http"):
+                continue
 
-                if video_link in seen_links:
-                    continue
-                seen_links.add(video_link)
+            # Lay tieu de
+            title_tag = link_tag.find('h4', class_='item__title')
+            if title_tag:
+                video_title = title_tag.get_text(strip=True)
+            else:
+                video_title = link_tag.get_text(strip=True)
+            
+            if not video_title or len(video_title) < 2:
+                video_title = "No title"
 
-                video_title = link_tag.get("title", "").strip()
-                if not video_title:
-                    title_h4 = link_tag.find("h4", class_="item__title")
-                    if title_h4:
-                        video_title = title_h4.get_text(strip=True)
-                
-                if not video_title or len(video_title) < 3:
-                    video_title = "No title"
-
-                videos.append({"source": "Sextop1", "title": video_title[:200], "link": video_link})
+            videos.append({
+                "source": "SexTop1",
+                "title": video_title[:200],
+                "link": video_link
+            })
+            
         except Exception:
             continue
 
     return videos
 
-async def search_videos_by_actor(actor_name: str) -> List[Dict[str, str]]:
-    """Tim kiem video cua dien vien tren sextop1 qua DuckDuckGo va crawl nhieu trang."""
+
+async def try_actress_url(crawler: AsyncWebCrawler, url: str) -> bool:
+    """Kiem tra xem URL co hop le khong."""
+    try:
+        videos = await crawl_sextop1_page(crawler, url)
+        return len(videos) > 0
+    except Exception:
+        return False
+
+
+async def search_videos_by_actor(actor_name: str, max_pages: int = 10) -> List[Dict[str, str]]:
+    """Tim kiem video cua dien vien tren SexTop1.movie."""
     try:
         browser_config = BrowserConfig(headless=True, verbose=False)
+        
         async with AsyncWebCrawler(config=browser_config) as crawler:
-            # Buoc 1: Tim kiem qua DuckDuckGo de lay URL chinh xac
-            actress_url = await search_actress_on_duckduckgo(crawler, actor_name)
+            print(f"\n{'='*60}")
+            print(f"CRAWL DIEN VIEN: {actor_name}")
+            print(f"{'='*60}\n")
             
-            # Buoc 2: Crawl tung trang (toi da 10 trang)
+            # Thu dung DuckDuckGo tim ten dung
+            correct_slug = search_actress_on_duckduckgo(actor_name)
+            
+            if not correct_slug:
+                print(f"[URL] Dung ten nhap: {actor_name}")
+                correct_slug = normalize_name_to_url(actor_name)
+            
+            # Tao danh sach URL de thu
+            base_url = "https://sextop1.movie"
+            urls_to_try = [f"{base_url}/actresses/{correct_slug}"]
+            
+            # Thu dao nguoc (last-first)
+            parts = correct_slug.split('-')
+            if len(parts) >= 2:
+                reversed_slug = '-'.join(reversed(parts))
+                urls_to_try.append(f"{base_url}/actresses/{reversed_slug}")
+            
+            print(f"[URL] Thu cac URL:")
+            for idx, url in enumerate(urls_to_try, 1):
+                print(f"  {idx}. {url}")
+            
+            # Tim URL hop le
+            valid_url = None
+            for url in urls_to_try:
+                print(f"\n[Test] {url}")
+                if await try_actress_url(crawler, url):
+                    print(f"[Test] ✓ URL hop le!")
+                    valid_url = url
+                    break
+                else:
+                    print(f"[Test] ✗ Khong co video")
+            
+            if not valid_url:
+                print("\n[LOI] Khong tim thay URL hop le!")
+                print("Vui long kiem tra lai ten dien vien.")
+                return []
+            
+            print(f"\n[OK] Su dung: {valid_url}\n")
+            
+            # Crawl cac trang
             all_videos: List[Dict[str, str]] = []
-            seen_all = set()
+            seen_links = set()
             
-            for page in range(1, 11):
-                videos = await crawl_sextop1_actress_page(crawler, actress_url, page)
-                
-                # Loc video trung lap
-                new_videos = []
-                for video in videos:
-                    if video['link'] not in seen_all:
-                        seen_all.add(video['link'])
-                        new_videos.append(video)
-                
-                # Dung neu trang khong co video moi
-                if not new_videos:
-                    break
-                
-                all_videos.extend(new_videos)
-                
-                # Dung neu da den trang 10
-                if page == 10:
-                    break
+            for page_num in range(1, max_pages + 1):
+                try:
+                    if page_num == 1:
+                        page_url = valid_url
+                    else:
+                        page_url = f"{valid_url}?page={page_num}"
+                    
+                    print(f"[Trang {page_num}] {page_url}")
+                    
+                    page_videos = await crawl_sextop1_page(crawler, page_url)
+                    
+                    if not page_videos:
+                        print(f"[Trang {page_num}] Khong co video. Dung lai.")
+                        break
+                    
+                    # Loc trung lap
+                    new_count = 0
+                    for video in page_videos:
+                        if video['link'] not in seen_links:
+                            seen_links.add(video['link'])
+                            all_videos.append(video)
+                            new_count += 1
+                    
+                    print(f"[Trang {page_num}] +{new_count} video moi")
+                    
+                    if new_count == 0:
+                        print(f"[Trang {page_num}] Khong con video moi. Dung lai.")
+                        break
+                    
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    print(f"[Trang {page_num}] Loi: {e}")
+                    continue
             
             return all_videos
-    except Exception:
+            
+    except Exception as e:
+        print(f"[LOI] {e}")
         return []
+
 
 def _print_results(results: List[Dict[str, str]]) -> None:
     """In ket qua ra console."""
     if not results:
-        print("Khong tim thay video.")
+        print("\n" + "="*60)
+        print("KHONG TIM THAY VIDEO!")
+        print("="*60)
         return
+    
+    print("\n" + "="*60)
+    print(f"TONG: {len(results)} VIDEO")
+    print("="*60 + "\n")
+    
     for idx, item in enumerate(results, 1):
-        print(f"{idx}. [{item.get('source', '')}] {item.get('title', '')} - {item.get('link', '')}")
+        print(f"{idx}. [{item.get('source', '')}] {item.get('title', '')}")
+        print(f"   {item.get('link', '')}\n")
+
 
 async def _main() -> None:
-    actor = input("Nhap ten dien vien: ").strip()
+    """Ham main."""
+    print("\n" + "="*60)
+    print("SEXTOP1.MOVIE CRAWLER")
+    print("="*60)
+    
+    actor = input("\nNhap ten dien vien: ").strip()
     if not actor:
-        print("Ten dien vien khong duoc de trong.")
+        print("\nTen dien vien khong duoc de trong!")
         return
-    print("Dang tim kiem, vui long doi...")
-    results = await search_videos_by_actor(actor)
+    
+    print("\nDang crawl, vui long doi...")
+    results = await search_videos_by_actor(actor, max_pages=10)
     _print_results(results)
+
 
 if __name__ == "__main__":
     asyncio.run(_main())
