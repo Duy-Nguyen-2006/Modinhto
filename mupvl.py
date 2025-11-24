@@ -1,123 +1,437 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Crawler mupvl.info: tim video theo ten dien vien, tra ve list dict cho backend.
+Script để crawl video theo diễn viên từ website mupvl.info
+Sử dụng Crawl4AI và BeautifulSoup để phân tích HTML
+Hỗ trợ phân trang và chuẩn hóa tên diễn viên qua DuckDuckGo
 """
 
-import asyncio
 import re
 import unicodedata
-from typing import List, Dict
-
-from bs4 import BeautifulSoup
+import asyncio
+from typing import List, Dict, Optional, Tuple
+from urllib.parse import urljoin, urlparse, parse_qs
 from crawl4ai import AsyncWebCrawler
+from bs4 import BeautifulSoup
+import json
+
+# Cấu hình
+BASE_URL = "https://mupvl.info"
+MAX_PAGES = 10  # Giới hạn số trang crawl cho mỗi diễn viên
 
 
 def normalize_name(name: str) -> str:
-    """Chuan hoa ten thanh slug don gian."""
-    name_normalized = unicodedata.normalize("NFKD", name or "")
-    name_no_accents = "".join([c for c in name_normalized if not unicodedata.combining(c)])
-    name_lower = name_no_accents.lower()
-    name_clean = re.sub(r"[^a-z0-9\s-]", "", name_lower)
-    slug = re.sub(r"\s+", "-", name_clean.strip())
-    slug = re.sub(r"-+", "-", slug)
+    """
+    Chuẩn hóa tên diễn viên thành slug
+    Loại bỏ dấu, chuyển thành chữ thường và thay thế khoảng trắng bằng dấu gạch ngang
+    
+    Args:
+        name: Tên diễn viên gốc (vd: "Eimi Fukada" hoặc "eimu fuk")
+    
+    Returns:
+        Slug chuẩn hóa (vd: "eimi-fukada")
+    """
+    # Loại bỏ dấu tiếng Việt và các ký tự đặc biệt
+    name = unicodedata.normalize('NFKD', name)
+    name = name.encode('ascii', 'ignore').decode('utf-8')
+    
+    # Chuyển thành chữ thường và loại bỏ ký tự đặc biệt
+    name = re.sub(r'[^a-zA-Z0-9\s-]', '', name.lower())
+    
+    # Thay thế nhiều khoảng trắng liên tiếp bằng 1 khoảng trắng
+    name = re.sub(r'\s+', ' ', name).strip()
+    
+    # Thay thế khoảng trắng bằng dấu gạch ngang
+    slug = name.replace(' ', '-')
+    
     return slug
 
 
-def create_actress_url(actress_name: str, base_url: str = "https://mupvl.info") -> str:
-    """Tao URL trang dien vien."""
-    slug = normalize_name(actress_name)
-    return f"{base_url}/actresses/{slug}"
-
-
-def is_valid_video(video_element) -> bool:
-    """Kiem tra video item co title/link hop le khong."""
-    try:
-        title_element = video_element.find("div", class_="video-item__title")
-        if not title_element:
-            return False
-        link_element = title_element.find("a")
-        if not link_element:
-            return False
-        title = link_element.get("title", "").strip()
-        href = link_element.get("href", "").strip()
-        return bool(title and href)
-    except Exception:
-        return False
-
-
-async def search_videos_by_actor(actress_name: str) -> List[Dict[str, str]]:
+async def search_actress_on_duckduckgo(query: str) -> Optional[str]:
     """
-    Tra ve danh sach video theo ten dien vien.
-
-    Output: [{'source': 'Mupvl', 'title': str, 'link': str}, ...]
+    Tìm kiếm tên diễn viên chuẩn trên DuckDuckGo
+    
+    Args:
+        query: Tên diễn viên (có thể sai chính tả)
+    
+    Returns:
+        Tên/slug diễn viên chuẩn, hoặc None nếu không tìm thấy
     """
+    print(f"🔍 Đang tìm kiếm '{query}' trên DuckDuckGo...")
+    
+    # Tạo query tìm kiếm với từ khóa actress/JAV
+    search_query = f"{query} actress JAV"
+    search_url = f"https://duckduckgo.com/html/?q={search_query}"
+    
     try:
-        actress_url = create_actress_url(actress_name)
-        videos: List[Dict[str, str]] = []
-        seen_urls = set()
-
         async with AsyncWebCrawler(verbose=False) as crawler:
-            result = await crawler.arun(url=actress_url, word_count_threshold=10, bypass_cache=True)
+            result = await crawler.arun(url=search_url)
+            
+            if not result.success:
+                print(f"⚠️  Không thể truy cập DuckDuckGo")
+                return None
+            
+            soup = BeautifulSoup(result.html, 'html.parser')
+            
+            # Tìm suggestion "Including results for" nếu có
+            did_you_mean = soup.find('div', id='did_you_mean')
+            if did_you_mean:
+                suggested_link = did_you_mean.find('a')
+                if suggested_link:
+                    suggested_text = suggested_link.get_text().strip().lower()
+                    # Loại bỏ "actress jav" khỏi suggested text
+                    suggested_text = re.sub(r'\s*(actress|jav)\s*', ' ', suggested_text, flags=re.IGNORECASE).strip()
+                    if suggested_text:
+                        print(f"✓ Gợi ý từ DuckDuckGo: {suggested_text}")
+                        return suggested_text
+            
+            # Tìm các kết quả tìm kiếm
+            results = soup.find_all('a', class_='result__a')
+            
+            for link in results[:10]:  # Kiểm tra 10 kết quả đầu tiên
+                text = link.get_text().strip()
+                
+                # Extract tên diễn viên từ title
+                # Pattern: Tìm tên người (các từ viết hoa liên tiếp)
+                # VD: "Melody Hiina Marks JAV Actress" -> "Melody Hiina Marks"
+                
+                # Cách 1: Tìm pattern "Name JAV" hoặc "Name Actress"
+                match = re.search(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:JAV|Actress|Porn|AV)', text)
+                if match:
+                    actress_name = match.group(1).lower()
+                    print(f"✓ Tìm thấy: {actress_name}")
+                    return actress_name
+                
+                # Cách 2: Lấy các từ viết hoa ở đầu title (trước các từ khóa)
+                words = text.split()
+                name_parts = []
+                for word in words:
+                    # Dừng khi gặp từ khóa không phải tên
+                    if word.lower() in ['jav', 'actress', 'porn', 'av', 'movies', 'videos', 'star', 'idol', 'model', '-', '|']:
+                        break
+                    # Lấy các từ viết hoa (có thể là tên)
+                    if word[0].isupper() and len(word) > 1:
+                        name_parts.append(word)
+                
+                if len(name_parts) >= 2:
+                    actress_name = ' '.join(name_parts).lower()
+                    print(f"✓ Tìm thấy: {actress_name}")
+                    return actress_name
+            
+            # Nếu không tìm thấy kết quả phù hợp, thử chuẩn hóa query gốc
+            print(f"⚠️  Không tìm thấy kết quả phù hợp, sử dụng tên gốc")
+            return query.lower().strip()
+            
+    except Exception as e:
+        print(f"⚠️  Lỗi khi tìm kiếm: {e}")
+        return query.lower().strip()
 
+
+def create_actress_url(actress_name: str, page: int = 1) -> List[str]:
+    """
+    Tạo các URL có thể có cho trang diễn viên
+    Thử nhiều pattern khác nhau để tìm URL đúng
+    
+    Args:
+        actress_name: Tên diễn viên đã chuẩn hóa
+        page: Số trang (mặc định là 1)
+    
+    Returns:
+        Danh sách các URL có thể có (sắp xếp theo độ ưu tiên)
+    """
+    slug = normalize_name(actress_name)
+    parts = slug.split('-')
+    
+    urls = []
+    page_suffix = f"?page={page}" if page > 1 else ""
+    
+    # Pattern 1: Tên đầy đủ (vd: melody-hiina-marks)
+    urls.append(f"{BASE_URL}/actresses/{slug}{page_suffix}")
+    
+    # Pattern 2: Nếu có 3 phần (First Middle Last), thử bỏ middle name
+    if len(parts) == 3:
+        # First-Last (vd: melody-marks)
+        first_last = f"{parts[0]}-{parts[2]}"
+        urls.append(f"{BASE_URL}/actresses/{first_last}{page_suffix}")
+        
+        # Last-First (vd: marks-melody)
+        last_first = f"{parts[2]}-{parts[0]}"
+        urls.append(f"{BASE_URL}/actresses/{last_first}{page_suffix}")
+        
+        # First-Middle (vd: melody-hiina) - ít phổ biến nhưng vẫn thử
+        first_middle = f"{parts[0]}-{parts[1]}"
+        urls.append(f"{BASE_URL}/actresses/{first_middle}{page_suffix}")
+    
+    # Pattern 3: Nếu có 2 phần (First Last), thử đảo ngược
+    elif len(parts) == 2:
+        # Last-First (vd: fukada-eimi)
+        reversed_slug = f"{parts[1]}-{parts[0]}"
+        urls.append(f"{BASE_URL}/actresses/{reversed_slug}{page_suffix}")
+    
+    # Pattern 4: Nếu có 4+ phần, thử các tổ hợp
+    elif len(parts) >= 4:
+        # First-Last
+        first_last = f"{parts[0]}-{parts[-1]}"
+        urls.append(f"{BASE_URL}/actresses/{first_last}{page_suffix}")
+        
+        # Last-First
+        last_first = f"{parts[-1]}-{parts[0]}"
+        urls.append(f"{BASE_URL}/actresses/{last_first}{page_suffix}")
+    
+    return urls
+
+
+async def check_url_validity(url: str, crawler) -> Tuple[bool, Optional[str]]:
+    """
+    Kiểm tra xem URL có hợp lệ không (HTTP 200 và có video)
+    
+    Args:
+        url: URL cần kiểm tra
+        crawler: AsyncWebCrawler instance
+    
+    Returns:
+        (valid, html) - True nếu hợp lệ, kèm theo HTML content
+    """
+    try:
+        result = await crawler.arun(url=url)
+        
         if not result.success:
-            return []
+            return False, None
+        
+        soup = BeautifulSoup(result.html, 'html.parser')
+        video_items = soup.find_all('div', class_='video-item')
+        
+        # Nếu có ít nhất 1 video item thì URL hợp lệ
+        if len(video_items) > 0:
+            return True, result.html
+        
+        return False, None
+        
+    except Exception as e:
+        return False, None
 
-        soup = BeautifulSoup(result.html, "html.parser")
-        video_list_container = soup.find("div", class_="list-videos")
-        if not video_list_container:
-            return []
 
-        video_items = video_list_container.find_all("div", class_="video-item")
-        for video_item in video_items:
+def extract_videos_from_html(html: str) -> List[Dict[str, str]]:
+    """
+    Trích xuất thông tin video từ HTML
+    
+    Args:
+        html: Nội dung HTML của trang
+    
+    Returns:
+        Danh sách các video với title và link
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    videos = []
+    
+    # Tìm tất cả các video items
+    video_items = soup.find_all('div', class_='video-item')
+    
+    for item in video_items:
+        # Tìm thẻ a đầu tiên (chứa link video)
+        link_tag = item.find('a', class_='video-item__thumb')
+        
+        if link_tag:
+            video_url = link_tag.get('href', '')
+            video_title = link_tag.get('title', '')
+            
+            # Nếu URL không đầy đủ, thêm base URL
+            if video_url and not video_url.startswith('http'):
+                video_url = urljoin(BASE_URL, video_url)
+            
+            # Nếu không có title từ thumb, thử lấy từ title div
+            if not video_title:
+                title_div = item.find('div', class_='video-item__title')
+                if title_div:
+                    title_link = title_div.find('a')
+                    if title_link:
+                        video_title = title_link.get('title', '') or title_link.get_text(strip=True)
+            
+            if video_url and video_title:
+                videos.append({
+                    'title': video_title.strip(),
+                    'link': video_url.strip()
+                })
+    
+    return videos
+
+
+def has_pagination(html: str) -> bool:
+    """
+    Kiểm tra xem trang có phân trang không
+    
+    Args:
+        html: Nội dung HTML của trang
+    
+    Returns:
+        True nếu có phân trang
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    pagenavi = soup.find('div', class_='pagenavi')
+    
+    if pagenavi and pagenavi.find_all('a'):
+        return True
+    
+    return False
+
+
+async def search_videos_by_actress(actress_name: str) -> List[Dict[str, str]]:
+    """
+    Tìm kiếm và crawl tất cả video của một diễn viên
+    Hỗ trợ phân trang tự động
+    
+    Args:
+        actress_name: Tên diễn viên đã chuẩn hóa
+    
+    Returns:
+        Danh sách tất cả video từ tất cả các trang
+    """
+    all_videos = []
+    seen_links = set()  # Để loại bỏ trùng lặp
+    
+    print(f"\n🎬 Bắt đầu crawl video của {actress_name}...")
+    
+    async with AsyncWebCrawler(verbose=False) as crawler:
+        # Bước 1: Tìm URL hợp lệ
+        print("📍 Đang tìm URL hợp lệ...")
+        possible_urls = create_actress_url(actress_name, page=1)
+        
+        valid_url = None
+        base_html = None
+        
+        for url in possible_urls:
+            print(f"   Thử: {url}")
+            is_valid, html = await check_url_validity(url, crawler)
+            
+            if is_valid:
+                valid_url = url
+                base_html = html
+                print(f"   ✓ URL hợp lệ!")
+                break
+        
+        if not valid_url:
+            print("❌ Không tìm thấy trang diễn viên hợp lệ")
+            return []
+        
+        # Bước 2: Crawl trang đầu tiên
+        print(f"\n📄 Crawl trang 1...")
+        videos = extract_videos_from_html(base_html)
+        
+        for video in videos:
+            if video['link'] not in seen_links:
+                all_videos.append(video)
+                seen_links.add(video['link'])
+        
+        print(f"   ✓ Tìm thấy {len(videos)} video")
+        
+        # Bước 3: Kiểm tra và crawl các trang tiếp theo
+        # Lấy base URL (không có query params)
+        base_actress_url = valid_url.split('?')[0]
+        
+        for page_num in range(2, MAX_PAGES + 1):
+            page_url = f"{base_actress_url}?page={page_num}"
+            
+            print(f"\n📄 Crawl trang {page_num}...")
+            print(f"   URL: {page_url}")
+            
             try:
-                if not is_valid_video(video_item):
-                    continue
+                result = await crawler.arun(url=page_url)
+                
+                if not result.success:
+                    print(f"   ⚠️  Không thể truy cập trang {page_num}")
+                    break
+                
+                videos = extract_videos_from_html(result.html)
+                
+                # Nếu không còn video, dừng lại
+                if len(videos) == 0:
+                    print(f"   ℹ️  Không còn video, dừng crawl")
+                    break
+                
+                # Thêm video mới vào danh sách
+                new_videos_count = 0
+                for video in videos:
+                    if video['link'] not in seen_links:
+                        all_videos.append(video)
+                        seen_links.add(video['link'])
+                        new_videos_count += 1
+                
+                print(f"   ✓ Tìm thấy {len(videos)} video ({new_videos_count} video mới)")
+                
+                # Nếu không có video mới, có thể đã hết
+                if new_videos_count == 0:
+                    print(f"   ℹ️  Không có video mới, dừng crawl")
+                    break
+                
+                # Delay nhỏ giữa các request
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                print(f"   ⚠️  Lỗi khi crawl trang {page_num}: {e}")
+                break
+    
+    return all_videos
 
-                title_div = video_item.find("div", class_="video-item__title")
-                link_tag = title_div.find("a") if title_div else None
-                if not link_tag:
-                    continue
 
-                title = link_tag.get("title", "").strip()
-                video_link = link_tag.get("href", "").strip()
-                if not title or not video_link:
-                    continue
-
-                if not video_link.startswith("http"):
-                    video_link = f"https://mupvl.info{video_link}"
-
-                if video_link in seen_urls:
-                    continue
-                seen_urls.add(video_link)
-
-                videos.append({"source": "Mupvl", "title": title, "link": video_link})
-            except Exception:
-                continue
-
-        return videos
-    except Exception:
-        return []
-
-
-def _print_results(results: List[Dict[str, str]]) -> None:
-    """In ket qua ra console."""
-    if not results:
-        print("Khong tim thay video.")
+def display_results(videos: List[Dict[str, str]], actress_name: str):
+    """
+    Hiển thị kết quả tìm kiếm một cách đẹp mắt
+    
+    Args:
+        videos: Danh sách video
+        actress_name: Tên diễn viên
+    """
+    print("\n" + "="*80)
+    print(f"🎯 KẾT QUẢ TÌM KIẾM CHO: {actress_name.upper()}")
+    print("="*80)
+    
+    if not videos:
+        print("\n❌ Không tìm thấy video nào!")
         return
-    for idx, item in enumerate(results, 1):
-        print(f"{idx}. [{item.get('source', '')}] {item.get('title', '')} - {item.get('link', '')}")
+    
+    print(f"\n✓ Tìm thấy tổng cộng {len(videos)} video\n")
+    
+    for idx, video in enumerate(videos, 1):
+        print(f"{idx}. {video['title']}")
+        print(f"   🔗 {video['link']}")
+        print()
+    
+    print("="*80)
 
 
-async def _main() -> None:
-    actress = input("Nhap ten dien vien: ").strip()
-    if not actress:
-        print("Ten dien vien khong duoc de trong.")
+async def main():
+    """
+    Hàm chính - chạy chương trình
+    """
+    print("="*80)
+    print("🎬 CÔNG CỤ TÌM KIẾM VIDEO THEO DIỄN VIÊN - MUPVL.INFO")
+    print("="*80)
+    
+    # Nhận input từ người dùng
+    actress_input = input("\n👤 Nhập tên diễn viên (VD: eimi fukada, eimu fuk): ").strip()
+    
+    if not actress_input:
+        print("❌ Vui lòng nhập tên diễn viên!")
         return
-    print("Dang tim kiem, vui long doi...")
-    results = await search_videos_by_actor(actress)
-    _print_results(results)
+    
+    print(f"\n📝 Bạn đã nhập: {actress_input}")
+    
+    # Bước 1: Chuẩn hóa tên qua DuckDuckGo
+    normalized_name = await search_actress_on_duckduckgo(actress_input)
+    
+    if not normalized_name:
+        print("❌ Không thể chuẩn hóa tên diễn viên. Vui lòng thử lại!")
+        return
+    
+    print(f"✓ Tên chuẩn: {normalized_name}")
+    
+    # Bước 2: Tìm kiếm video
+    videos = await search_videos_by_actress(normalized_name)
+    
+    # Bước 3: Hiển thị kết quả
+    display_results(videos, normalized_name)
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    # Chạy chương trình
+    asyncio.run(main())

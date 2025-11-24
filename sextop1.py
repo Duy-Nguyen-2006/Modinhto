@@ -12,6 +12,7 @@ Tinh nang:
 import asyncio
 import re
 import unicodedata
+from urllib.parse import urlparse, parse_qs, unquote
 from typing import List, Dict, Optional
 import requests
 from bs4 import BeautifulSoup
@@ -33,14 +34,14 @@ def search_actress_on_duckduckgo(actress_name: str) -> Optional[str]:
     try:
         print(f"[DuckDuckGo] Tim kiem: {actress_name}")
         
-        query = f"{actress_name} actress jav pornstar"
-        search_url = f"https://html.duckduckgo.com/html/?q={query}"
+        query = f"site:sextop1.movie {actress_name} actresses"
+        search_url = "https://html.duckduckgo.com/html/"
         
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
-        response = requests.get(search_url, headers=headers, timeout=10)
+        response = requests.get(search_url, params={"q": query}, headers=headers, timeout=10)
         
         if response.status_code != 200:
             return None
@@ -48,19 +49,37 @@ def search_actress_on_duckduckgo(actress_name: str) -> Optional[str]:
         soup = BeautifulSoup(response.content, 'html.parser')
         results = soup.find_all('a', class_='result__a')
         
-        if not results:
-            return None
-        
-        first_result = results[0].get_text(strip=True)
-        print(f"[DuckDuckGo] Ket qua: {first_result}")
-        
-        # Trich xuat ten (lay phan truoc dau : hoac -)
-        match = re.match(r'^([^:\-\|]+)', first_result)
-        if match:
-            actress_found = match.group(1).strip()
-            normalized = normalize_name_to_url(actress_found)
-            print(f"[DuckDuckGo] Slug: {normalized}")
-            return normalized
+        for link_tag in results:
+            raw_href = link_tag.get("href") or ""
+            target_url = None
+            
+            if raw_href.startswith("//duckduckgo.com/l/?"):
+                parsed = urlparse("https:" + raw_href)
+                target_url = parse_qs(parsed.query).get("uddg", [None])[0]
+                if target_url:
+                    target_url = unquote(target_url)
+            elif raw_href.startswith("http"):
+                target_url = raw_href
+            
+            if not target_url or "sextop1.movie" not in target_url:
+                continue
+            
+            parsed_target = urlparse(target_url)
+            path = parsed_target.path
+            
+            if "/actresses/" in path:
+                slug = path.split("/actresses/", 1)[-1].strip("/").split("/")[0]
+                slug = normalize_name_to_url(slug)
+                print(f"[DuckDuckGo] URL: {target_url}")
+                print(f"[DuckDuckGo] Slug: {slug}")
+                return slug
+            
+            if "/search/" in path:
+                slug = path.split("/search/", 1)[-1].strip("/").split("/")[0]
+                slug = normalize_name_to_url(slug)
+                print(f"[DuckDuckGo] URL tim kiem: {target_url}")
+                print(f"[DuckDuckGo] Slug tim kiem: {slug}")
+                return slug
         
         return None
         
@@ -163,6 +182,13 @@ async def search_videos_by_actor(actor_name: str, max_pages: int = 10) -> List[D
             if len(parts) >= 2:
                 reversed_slug = '-'.join(reversed(parts))
                 urls_to_try.append(f"{base_url}/actresses/{reversed_slug}")
+            
+            # Thu trang tim kiem noi site (phong truong hop khong co trang actress)
+            search_slug = correct_slug or normalize_name_to_url(actor_name)
+            urls_to_try.append(f"{base_url}/search/{search_slug}")
+            
+            # Loai bo trung lap, giu nguyen thu tu thu nghiem
+            urls_to_try = list(dict.fromkeys(urls_to_try))
             
             print(f"[URL] Thu cac URL:")
             for idx, url in enumerate(urls_to_try, 1):
