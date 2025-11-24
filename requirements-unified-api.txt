@@ -1,0 +1,9 @@
+# Dependencies cho Unified API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Dependencies cho các scraper
+crawl4ai>=0.2.0
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+lxml>=4.9.0
