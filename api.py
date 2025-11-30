@@ -2,14 +2,14 @@ import asyncio
 import os
 import random
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 from fastapi import FastAPI, Query, Security, HTTPException, status
 from fastapi.security import APIKeyHeader
-from sqlmodel import Field, Session, SQLModel, create_engine, select
-from groq import Groq
+from fastapi.middleware.cors import CORSMiddleware
+from sqlmodel import Field, Session, SQLModel, create_engine, select, desc
+import google.generativeai as genai
 from dotenv import load_dotenv
 
-# Load biến môi trường
 load_dotenv()
 
 # --- 1. CẤU HÌNH DATABASE ---
@@ -28,46 +28,27 @@ engine = create_engine(sqlite_url)
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
-# --- 2. CẤU HÌNH GROQ (XOAY VÒNG KEY) ---
-groq_keys_str = os.getenv("GROQ_API_KEYS", "")
-GROQ_KEYS = [k.strip() for k in groq_keys_str.split(",") if k.strip()]
+# --- 2. CẤU HÌNH GEMINI ---
+GOOGLE_KEY = os.getenv("GOOGLE_API_KEY")
+if GOOGLE_KEY: genai.configure(api_key=GOOGLE_KEY)
 
-def get_random_groq_client():
-    if not GROQ_KEYS: return None
-    selected_key = random.choice(GROQ_KEYS)
-    # print(f"DEBUG: Đang dùng key {selected_key[:10]}...") 
-    return Groq(api_key=selected_key)
-
-def groq_fix_typo(user_query: str, candidate_names: list[str]) -> str | None:
-    client = get_random_groq_client()
-    if not client or not candidate_names: return None
-
-    names_str = "\n".join([f"- {name}" for name in candidate_names[:300]])
-    prompt = f"""You are a spell checker for Japanese AV actresses.
-Valid names list:
-{names_str}
-User query: "{user_query}"
-Task: Find the exact matching name from the list for the user query, ignoring typos or spacing differences.
-Rules:
-1. If found, return ONLY the exact name from the list.
-2. If NOT found, return ONLY the string "None".
-3. Do not explain."""
-
+def gemini_normalize_name(user_query: str) -> str:
+    """Dùng Gemini 1.5 Flash để chuẩn hóa tên diễn viên."""
+    if not GOOGLE_KEY: return user_query.lower()
+    
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    prompt = f"""The user query is "{user_query}". Your ONLY task is to return the correctly spelled name for that JAV/Adult actress. 
+    - If the query is a typo, fix it.
+    - If correct, return as is.
+    - If unsure, return the original query.
+    Output ONLY the name in lowercase. Do not explain."""
+    
     try:
-        completion = client.chat.completions.create(
-            model="llama3-8b-8192", 
-            messages=[
-                {"role": "system", "content": "Output only the name or None."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=50
-        )
-        result = completion.choices[0].message.content.strip()
-        return result if result != "None" and result in candidate_names else None
-    except Exception as e:
-        print(f"❌ Groq lỗi: {e}")
-        return None
+        response = model.generate_content(prompt)
+        result = response.text.strip().lower()
+        if len(result) < 2 or "sorry" in result: return user_query.lower()
+        return result
+    except: return user_query.lower()
 
 # --- 3. IMPORT CRAWLERS ---
 crawlers = []
@@ -83,44 +64,42 @@ try:
     from xhamster import search_videos_by_actor as s_xhamster; crawlers.append(s_xhamster)
     from sextop1 import search_videos_by_actor as s_sextop1; crawlers.append(s_sextop1)
     from mupvl import search_videos_by_actress as s_mupvl; crawlers.append(s_mupvl)
-except ImportError as e:
-    print(f"❌ Lỗi import crawler: {e}")
+except: pass
 
-# --- 4. BẢO MẬT API ---
+# --- 4. APP & MIDDLEWARE ---
+app = FastAPI()
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
 API_KEY = os.getenv("MY_SECRET_KEY")
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key == API_KEY: return api_key
-    raise HTTPException(status_code=403, detail="Sai Key rồi thằng ngu")
-
-app = FastAPI()
+    return "public_access"
 
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
 
-@app.get("/search", dependencies=[Security(verify_api_key)])
+# --- API 1: TÌM KIẾM & CRAWL ---
+@app.get("/search")
 async def search_aggregate(q: str = Query(..., min_length=1)):
     clean_query = q.lower().strip()
     
-    # Check Cache
+    # 1. Chuẩn hóa Khóa tìm kiếm (Target Key)
+    target_query = gemini_normalize_name(clean_query)
+    final_name = target_query.title()
+    
+    # 2. Tìm trong Cache với KHÓA CHUẨN
     with Session(engine) as session:
-        existing_queries = session.exec(select(VideoCache.search_query).distinct()).all()
-        target_query = clean_query
-        
-        if existing_queries:
-            corrected = groq_fix_typo(clean_query, existing_queries)
-            if corrected:
-                print(f"🤖 Groq sửa: '{clean_query}' -> '{corrected}'")
-                target_query = corrected
-
         results_db = session.exec(select(VideoCache).where(VideoCache.search_query == target_query)).all()
+        
         if results_db:
-            return {"source": f"DATABASE (Query: {target_query})", "count": len(results_db), "results": results_db}
+            print(f"DEBUG: CACHE HIT! Khóa: {target_query}")
+            return {"source": "CACHE", "actor_name": final_name, "count": len(results_db), "results": results_db}
 
-    # Crawl mới
-    print(f"🐢 Crawling: {target_query}...")
+    # 3. Crawl mới
     tasks = [func(target_query) for func in crawlers]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
@@ -128,19 +107,27 @@ async def search_aggregate(q: str = Query(..., min_length=1)):
     for res in results:
         if isinstance(res, list): final_data.extend(res)
     
-    # Lưu Cache
+    # 4. Lưu vào kho với KHÓA CHUẨN
     if final_data:
         with Session(engine) as session:
             for item in final_data:
                 session.add(VideoCache(
-                    search_query=target_query,
+                    search_query=target_query, # LƯU VỚI TÊN ĐÃ CHUẨN HÓA
                     source=item.get('source', 'Unknown'),
                     title=item.get('title', 'No Title'),
                     link=item.get('link', '#')
                 ))
             session.commit()
             
-    return {"source": "LIVE CRAWL", "count": len(final_data), "results": final_data}
+    return {"source": "LIVE", "actor_name": final_name, "count": len(final_data), "results": final_data}
+
+# --- API 2: LẤY DANH SÁCH MỚI NHẤT ---
+@app.get("/latest")
+async def get_latest(limit: int = 9, offset: int = 0):
+    with Session(engine) as session:
+        statement = select(VideoCache).order_by(desc(VideoCache.created_at)).offset(offset).limit(limit)
+        results = session.exec(statement).all()
+        return results
 
 if __name__ == "__main__":
     import uvicorn
